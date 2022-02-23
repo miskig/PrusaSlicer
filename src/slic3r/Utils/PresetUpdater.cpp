@@ -20,6 +20,7 @@
 #include "libslic3r/format.hpp"
 #include "libslic3r/Utils.hpp"
 #include "libslic3r/PresetBundle.hpp"
+#include "libslic3r/miniz_extension.hpp"
 #include "slic3r/GUI/GUI.hpp"
 #include "slic3r/GUI/I18N.hpp"
 #include "slic3r/GUI/UpdateDialogs.hpp"
@@ -148,6 +149,7 @@ struct PresetUpdater::priv
 	std::string version_check_url;
 
 	fs::path cache_path;
+	fs::path cache_vendor_path;
 	fs::path rsrc_path;
 	fs::path vendor_path;
 
@@ -174,6 +176,7 @@ struct PresetUpdater::priv
 
 PresetUpdater::priv::priv()
 	: cache_path(fs::path(Slic3r::data_dir()) / "cache")
+	, cache_vendor_path(cache_path / "vendor")
 	, rsrc_path(fs::path(resources_dir()) / "profiles")
 	, vendor_path(fs::path(Slic3r::data_dir()) / "vendor")
 	, cancel(false)
@@ -341,6 +344,42 @@ void PresetUpdater::priv::sync_config(const VendorMap vendors)
 
 	if (!enabled_config_update) { return; }
 
+	// TODO:
+	// Download profiles bundle index
+	// Download profiles bundle zip
+
+	fs::path bundle_path(cache_path / "Bundle.zip");
+	// Unzip bundle to cache / vendor
+	mz_zip_archive archive;
+	mz_zip_zero_struct(&archive);
+	if (!open_zip_reader(&archive, bundle_path.string() ))
+		BOOST_LOG_TRIVIAL(error) << "Couldn't open zipped bundle.";
+	else {
+		mz_uint num_entries = mz_zip_reader_get_num_files(&archive);
+		// loop the entries 
+		mz_zip_archive_file_stat stat;
+		for (mz_uint i = 0; i < num_entries; ++i) {
+			if (mz_zip_reader_file_stat(&archive, i, &stat)) {
+				std::string name(stat.m_filename);
+				if (stat.m_uncomp_size > 0) {
+					std::string buffer((size_t)stat.m_uncomp_size, 0);
+					mz_bool res = mz_zip_reader_extract_file_to_mem(&archive, stat.m_filename, (void*)buffer.data(), (size_t)stat.m_uncomp_size, 0);
+					if (res == 0) {
+						BOOST_LOG_TRIVIAL(error) << "Failed to unzip " << stat.m_filename;
+						continue;
+					}
+					fs::path tmp_path(cache_vendor_path / (name + ".tmp"));
+					fs::path target_path(cache_vendor_path / name);
+					fs::fstream file(tmp_path, std::ios::out | std::ios::binary | std::ios::trunc);
+					file.write(buffer.c_str(), buffer.size());
+					file.close();
+					fs::rename(tmp_path, target_path);
+				}
+			}
+		}
+		close_zip_reader(&archive);
+	}
+
 	// Donwload vendor preset bundles
 	// Over all indices from the cache directory:
 	for (auto &index : index_db) {
@@ -348,13 +387,18 @@ void PresetUpdater::priv::sync_config(const VendorMap vendors)
 
 		const auto vendor_it = vendors.find(index.vendor());
 		if (vendor_it == vendors.end()) {
-			BOOST_LOG_TRIVIAL(warning) << "No such vendor: " << index.vendor();
+			BOOST_LOG_TRIVIAL(info) << "No such vendor: " << index.vendor();
 			continue;
 		}
-
+		
+		
 		const VendorProfile &vendor = vendor_it->second;
+		const std::string idx_path = (cache_path / (vendor.id + ".idx")).string();
+		const std::string idx_path_temp = (cache_vendor_path / (vendor.id + ".idx")).string();
+		// Done by downloading bundle
+		/*
 		if (vendor.config_update_url.empty()) {
-			BOOST_LOG_TRIVIAL(info) << "Vendor has no config_update_url: " << vendor.name;
+			BOOST_LOG_TRIVIAL(warning) << "Vendor has no config_update_url: " << vendor.name;
 			continue;
 		}
 
@@ -372,7 +416,7 @@ void PresetUpdater::priv::sync_config(const VendorMap vendors)
 		}
 		if (!get_file(idx_url, idx_path_temp)) { continue; }
 		if (cancel) { return; }
-
+		*/
 		// Load the fresh index up
 		{
 			Index new_index;
@@ -386,7 +430,8 @@ void PresetUpdater::priv::sync_config(const VendorMap vendors)
 				BOOST_LOG_TRIVIAL(warning) << format("The downloaded index %1% for vendor %2% is older than the active one. Ignoring the downloaded index.", idx_path_temp, vendor.name);
 				continue;
 			}
-			Slic3r::rename_file(idx_path_temp, idx_path);
+			fs::copy_file(idx_path_temp, idx_path, fs::copy_option::overwrite_if_exists);
+			
 			//if we rename path we need to change it in Index object too or create the object again
 			//index = std::move(new_index);
 			try {
@@ -416,12 +461,24 @@ void PresetUpdater::priv::sync_config(const VendorMap vendors)
 
 		if (vendor.config_version >= recommended) { continue; }
 
+		
+		const auto bundle_tmp_path = cache_vendor_path / (vendor.id + ".ini");
+		const auto bundle_final_path = cache_path / (vendor.id + ".ini");
 		// Download a fresh bundle
+		// Done by bundle of profiles
+		/*
 		BOOST_LOG_TRIVIAL(info) << "Downloading new bundle for vendor: " << vendor.name;
 		const auto bundle_url = format("%1%/%2%.ini", vendor.config_update_url, recommended.to_string());
-		const auto bundle_path = cache_path / (vendor.id + ".ini");
 		if (! get_file(bundle_url, bundle_path)) { continue; }
 		if (cancel) { return; }
+		*/
+		// Check version
+		if (!boost::filesystem::exists(bundle_tmp_path))
+			continue;
+		auto vp = VendorProfile::from_ini(bundle_tmp_path, true);
+		if (vp.config_version != recommended)
+			continue;
+		fs::copy_file(bundle_tmp_path, bundle_final_path, fs::copy_option::overwrite_if_exists);
 
 		// check the newly downloaded bundle for missing resources
 		// for that, the ini file must be parsed
@@ -438,7 +495,6 @@ void PresetUpdater::priv::sync_config(const VendorMap vendors)
 				self.get_file(resource_url, resource_path);
 			}
 		};
-		auto vp = VendorProfile::from_ini(bundle_path, true);
 		for (const auto& model : vp.models) {
 			check_and_get_resource(vp.id, model.bed_texture, vendor.config_update_url, vendor_path, rsrc_path, cache_path);
 			if (cancel) { return; }
